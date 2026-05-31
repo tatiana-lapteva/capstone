@@ -4,6 +4,8 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import TimeSeriesSplit
 from dataclasses import dataclass, field
+from pathlib import Path
+import utils
 
 
 ## =============== CONSTANTS ===============
@@ -39,20 +41,68 @@ class PreprocessArtifacts:
     feature_cols: list
     cat_cols: list
 
+def optimize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """ Reduce memory usage by downcasting numeric columns. """
+    df        = df.copy()
+    # start_mem = df.memory_usage(deep=True).sum() / 1024**2
+
+    for col in df.columns:
+        col_type = df[col].dtype
+
+        if pd.api.types.is_integer_dtype(col_type):
+            c_min = int(df[col].min())
+            c_max = int(df[col].max())
+
+            if c_min >= 0:
+                if c_max <= np.iinfo(np.uint8).max:
+                    df[col] = df[col].astype(np.uint8)
+                elif c_max <= np.iinfo(np.uint16).max:
+                    df[col] = df[col].astype(np.uint16)
+                elif c_max <= np.iinfo(np.uint32).max:
+                    df[col] = df[col].astype(np.uint32)
+            else:
+                if c_min >= np.iinfo(np.int8).min and c_max <= np.iinfo(np.int8).max:
+                    df[col] = df[col].astype(np.int8)
+                elif c_min >= np.iinfo(np.int16).min and c_max <= np.iinfo(np.int16).max:
+                    df[col] = df[col].astype(np.int16)
+                elif c_min >= np.iinfo(np.int32).min and c_max <= np.iinfo(np.int32).max:
+                    df[col] = df[col].astype(np.int32)
+
+        elif pd.api.types.is_float_dtype(col_type):
+            df[col] = df[col].astype(np.float32)
+
+    if "TransactionDT" in df.columns:
+        df["TransactionDT"] = df["TransactionDT"].astype(np.int32)
+
+    if "isFraud" in df.columns:
+        df["isFraud"] = df["isFraud"].astype(np.int8)
+
+    # end_mem = df.memory_usage(deep=True).sum() / 1024**2
+    # print(
+    #     f"Memory: {start_mem:.1f} MB → {end_mem:.1f} MB "
+    #     f"({100*(start_mem - end_mem) / start_mem:.1f}% reduction)"
+    # )
+    return df
 
 ## =============== DATA LOADING ===============
 def load_data(path='../data/raw/IEEE-CIS Fraud Detection/'):
-    train_trans = pd.read_csv(f'{path}train_transaction.csv')
-    train_ident = pd.read_csv(f'{path}train_identity.csv')
-    test_trans  = pd.read_csv(f'{path}test_transaction.csv')
-    test_ident  = pd.read_csv(f'{path}test_identity.csv')
-    
+    p = Path(path)
+    train_trans = pd.read_csv(p / 'train_transaction.csv')
+    train_trans = optimize_dtypes(train_trans)
+    train_ident = pd.read_csv(p / 'train_identity.csv')
+    train_ident = optimize_dtypes(train_ident)
+    train       = train_trans.merge(train_ident, on='TransactionID', how='left')
+    del train_trans, train_ident
+    utils.clear_memory()
+    test_trans  = pd.read_csv(p / 'test_transaction.csv')
+    test_trans  = optimize_dtypes(test_trans)
+    test_ident  = pd.read_csv(p / 'test_identity.csv')
+    test_ident  = optimize_dtypes(test_ident)
     # Fix columns names in Test Dataset
     test_ident.columns = test_ident.columns.str.replace("-", "_")
-
-    train = train_trans.merge(train_ident, on='TransactionID', how='left')
-    test  = test_trans.merge(test_ident,  on='TransactionID', how='left')
-    
+    test        = test_trans.merge(test_ident,  on='TransactionID', how='left')
+    del test_trans, test_ident
+    utils.clear_memory()
     return train, test
 
 
@@ -527,7 +577,7 @@ def _oof_target_encode(df, col, smoothing=10.0, n_splits=5):
     orig_index = df_sorted.index
     df_sorted  = df_sorted.reset_index(drop=True).copy()
 
-    # ✅ конвертуємо category → str один раз на початку
+    # Convert category to str
     if pd.api.types.is_categorical_dtype(df_sorted[col]):
         df_sorted[col] = df_sorted[col].astype(str)
 
@@ -664,20 +714,19 @@ def categorical_encoding_train(
             "global_mean": global_mean,
         }
 
-    # ── Перевірка object dtype ────────────────────────────────
-    problem_cols = [
-        c for c in df.select_dtypes(include=["object"]).columns
-        if c not in node_source_cols
-    ]
-    if problem_cols:
-        print(f"  ⚠️  object dtype : {problem_cols}")
+    # # Object dtype validation
+    # problem_cols = [
+    #     c for c in df.select_dtypes(include=["object"]).columns
+    #     if c not in node_source_cols
+    # ]
+    # if problem_cols:
+    #     print(f"object dtype : {problem_cols}")
 
     encoded_cols = [
         col for col in encoders
         if encoders[col].get("type") not in ("freq", "fraud_rate")
         and col in df.columns
     ] + [
-    # ✅ fraud_rate — виключити з log transform
     f"{col}_fraud_rate"
     for col in node_source_cols
     if f"{col}_fraud_rate" in df.columns
@@ -847,8 +896,6 @@ def create_amount_ratio_features(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Ratio поточної суми до середньої по user/card.
-    ✅ Fit тільки на train — no leakage.
-    ✅ Викликати ДО log_transform.
     """
     train_df = train_df.copy()
     val_df   = val_df.copy()
@@ -871,8 +918,12 @@ def create_amount_ratio_features(
             df[col_name] = (
                 df["TransactionAmt"] / (denom + 1e-8)
             ).clip(0, 100).astype("float32")
+    ratio_maps = {                              
+        "user_amt_mean": maps["user_id"],
+        "card_amt_mean": maps["card1"],
+    }
 
-    return train_df, val_df
+    return train_df, val_df, ratio_maps
 
 
 def analyze_skewness(
@@ -998,6 +1049,50 @@ def analyze_skewness(
     # print(f"{'═' * width}\n")
 
     return result, right_log_cols, left_log_cols
+
+
+
+
+## ===============
+
+def prepare_dataset(X_train, X_val, train_emb, val_emb, emb_cols):
+    X_train = X_train.copy()
+    X_val = X_val.copy()
+
+    X_train = X_train.reset_index(drop=True)
+    X_val   = X_val.reset_index(drop=True)
+
+    assert len(train_emb) == len(X_train), \
+        f"Train embeddings mismatch: {len(train_emb)} != {len(X_train)}"
+    assert len(val_emb) == len(X_val), \
+        f"Val embeddings mismatch: {len(val_emb)} != {len(X_val)}"
+
+    assert not np.isnan(train_emb).any(), "NaN в train embeddings!"
+    assert not np.isnan(val_emb).any(),   "NaN в val embeddings!"
+    assert not np.isinf(train_emb).any(), "Inf в train embeddings!"
+    assert not np.isinf(val_emb).any(),   "Inf в val embeddings!"
+
+    train_emb_df = pd.DataFrame(
+        train_emb, columns=emb_cols, index=X_train.index
+    )
+    val_emb_df = pd.DataFrame(
+        val_emb, columns=emb_cols, index=X_val.index
+    )
+
+    X_train_gnn = pd.concat([X_train, train_emb_df], axis=1)
+    X_val_gnn   = pd.concat([X_val,   val_emb_df],   axis=1)
+
+    assert X_train_gnn.shape == (len(X_train), X_train.shape[1] + len(emb_cols)), \
+        f"X_train_gnn shape mismatch: {X_train_gnn.shape}"
+    assert X_val_gnn.shape == (len(X_val), X_val.shape[1] + len(emb_cols)), \
+        f"X_val_gnn shape mismatch: {X_val_gnn.shape}"
+
+    assert not X_train_gnn[emb_cols].isna().any().any(), \
+        "NaN в embedding колонках X_train_gnn!"
+    assert not X_val_gnn[emb_cols].isna().any().any(), \
+        "NaN в embedding колонках X_val_gnn!"
+
+    return X_train_gnn, X_val_gnn
 
 
 
